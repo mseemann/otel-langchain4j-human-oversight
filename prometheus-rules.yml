@@ -1,0 +1,129 @@
+# Prometheus alert rules - human oversight (Art. 14 EU AI Act).
+#
+# Metrics come from the OTel Collector's spanmetrics connector (see
+# otel-collector-config.yml). Labels follow the usual OTel-attribute-dot to
+# Prometheus-label-underscore convention (human_oversight.route_chosen ->
+# human_oversight_route_chosen). Boolean signals are strings ("true"/"false"),
+# not real booleans - Prometheus label matching is always string matching.
+#
+# Signals are set by LangChain4jController#tagHumanOversightSignals on the
+# root span of /lc4j/order-status.
+
+groups:
+  - name: human-oversight
+    rules:
+
+      # Misrouting backstop fired. possible_misroute is deterministic (a keyword check against
+      # the raw customerNote, see COMPENSATION_SIGNAL_KEYWORDS in LangChain4jController) - every
+      # occurrence is already the relevant event itself, not noise that needs confirming over a
+      # time window. No for-delay, no rate threshold: even a single possible misroute is, under
+      # Art. 14, reportable on its own - the model chose route_status_inquiry even though the
+      # note contained a compensation signal.
+      - alert: PossibleMisrouteDetected
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{human_oversight_possible_misroute="true"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Router may have misrouted (status lookup despite a compensation signal)"
+          description: |
+            {{ $value }} trace(s) in the last 5 minutes with human_oversight.possible_misroute=true.
+            The model chose route_status_inquiry even though the customerNote contained a
+            keyword from COMPENSATION_SIGNAL_KEYWORDS (e.g. "damaged", "refund", "complaint").
+            The customer has already received the plain status answer - needs_review is also
+            true in this case. See the review queue (review-queue/review-queue.jsonl) for the
+            exact trace IDs, then check the detail in Jaeger.
+
+      # Routing failed. No for-delay, same reasoning as above: routing_failed should
+      # structurally NEVER be true - toolChoice=REQUIRED forces the router call to always return
+      # a tool call. If it happens anyway, it's not a normal operating case (unlike
+      # possible_misroute, which covers a regular, if rare, model misjudgment) - it's an
+      # API/transport error or an unexpected Anthropic API response shape, worth a look
+      # immediately.
+      - alert: RoutingFailed
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{human_oversight_routing_failed="true"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Router call did not return a tool call despite toolChoice=REQUIRED"
+          description: |
+            {{ $value }} trace(s) in the last 5 minutes with human_oversight.routing_failed=true.
+            The customer received the safe ESCALATION_FALLBACK_ANSWER - no data loss, but a sign
+            of an API/transport problem that shouldn't occur structurally. Details in Jaeger via
+            the trace IDs from review-queue/review-queue.jsonl.
+
+      # Output Guard blocked an answer. No for-delay, same reasoning: unlike the other four
+      # signals, output_guard_triggered=true doesn't just mean "review needed" - it means the
+      # answer has ALREADY BEEN REPLACED before reaching the end user. By the Air Canada/Chevy
+      # standard this is the most expensive case imaginable - every single occurrence is
+      # immediately relevant, not noise to confirm over a time window.
+      - alert: OutputGuardTriggered
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{human_oversight_output_guard_triggered="true"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          domain: human-oversight
+        annotations:
+          summary: "Output Guard blocked an LLM answer for an unauthorized commitment"
+          description: |
+            {{ $value }} trace(s) in the last 5 minutes with
+            human_oversight.output_guard_triggered=true. The end user got the fixed
+            OutputGuard.FALLBACK_ANSWER instead of the LLM answer. Which pattern matched is in
+            the span attribute human_oversight.output_guard_matched_pattern - see the review
+            queue (review-queue/review-queue.jsonl) for the trace IDs, then check the detail in
+            Jaeger.
+
+      # Goodwill-gesture route chosen. No for-delay, same reasoning as OutputGuardTriggered: no
+      # answer was replaced here, but a customer is now waiting on a human decision about a
+      # concrete voucher proposal. Every occurrence is immediately relevant - otherwise nobody
+      # notices an escalation sitting in the review queue until HumanReviewQueueGrowing fires,
+      # 30 minutes later at the earliest.
+      - alert: GoodwillGestureRouted
+        expr: |
+          sum(increase(traces_span_metrics_calls_total{human_oversight_route_chosen="propose_goodwill_gesture"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Router proposed a goodwill-gesture review"
+          description: |
+            {{ $value }} trace(s) in the last 5 minutes with
+            human_oversight.route_chosen="propose_goodwill_gesture". The proposal (a fixed
+            amount, see GoodwillGesturePolicy.VOUCHER_CENTS) is NOT yet approved - see the
+            review queue (review-queue/review-queue.jsonl) for the exact trace IDs, then submit
+            traceId/spanId from there to POST /lc4j/human-intervention for a decision.
+
+      # Review queue has had sustained inflow for a while.
+      #
+      # IMPORTANT on what this actually measures: this is NOT a real gauge on queue DEPTH -
+      # there's no endpoint/metric for "completed" reviews to subtract from the incoming flags.
+      # The alert only measures "over the last 30 minutes, at least one new needs_review=true
+      # trace arrived per interval, continuously" - i.e. sustained INFLOW, not a provably growing
+      # BACKLOG. A real depth metric would need a second counter built from completed
+      # human_intervention spans, deliberately not built here (correlating by trace ID doesn't
+      # map cleanly onto PromQL/spanmetrics - that would need an evaluation over the review queue
+      # file itself instead).
+      - alert: HumanReviewQueueGrowing
+        expr: |
+          sum(rate(traces_span_metrics_calls_total{human_oversight_needs_review="true"}[30m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+          domain: human-oversight
+        annotations:
+          summary: "Sustained inflow into the human review queue"
+          description: |
+            Traces with human_oversight.needs_review=true have been arriving continuously for at
+            least 30 minutes (route_chosen is propose_goodwill_gesture or escalate_to_support,
+            possible_misroute, routing_failed, user-flagged, or the Output Guard blocked a
+            commitment - all deterministic, no LLM judge). This is NOT proof of a growing
+            backlog depth (see comment above) - but a sign that someone should look at the
+            queue: review-queue/review-queue.jsonl, then submit traceId/spanId from there to
+            POST /lc4j/human-intervention.
