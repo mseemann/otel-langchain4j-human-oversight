@@ -7,44 +7,25 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * PII tokenization BEFORE the cloud LLM call.
- *
- * Different from the PII masking that also happens in the OTel Collector (transform/mask-pii in
- * otel-collector-config.yml): the Collector's masking acts AFTER THE FACT on whatever gets
- * exported/telemetered - the actual prompt sent to the cloud LLM provider (Anthropic) bypasses it
- * entirely, because the API call happens before any span is exported. This class intervenes
- * BEFORE the call: detected PII is replaced with a placeholder token, the mapping table stays
- * exclusively in this process (NEVER goes to the LLM provider), and the answer is mapped back
- * before being delivered to the user.
- *
- * Deliberately the same four categories as transform/mask-pii in the Collector (email / phone /
- * IBAN / card number) - consistent with the existing detection, not a second detection mechanism
- * with its own blind spots. Important, deliberately not hidden limitation: regex only catches
- * what LOOKS LIKE one of these four categories. Names, addresses, or other free-form context PII
- * are NOT detected - that would need NER (e.g. Presidio). This class is an additional line of
- * defense before the cloud call, not a replacement for better detection.
- *
- * Note: IBAN/phone patterns below are intentionally still German-format (DE.../+49...) - this
- * demo's "customer" data is German-market data, and the patterns are a direct, literal port of
- * the source project's detection. A real deployment would parametrize country/format.
+ * PII tokenization BEFORE the cloud LLM call - different from the OTel Collector's PII masking
+ * (transform/mask-pii in otel-collector-config.yml), which only acts AFTER THE FACT on exported
+ * telemetry and never sees the actual prompt sent to Anthropic. This class replaces PII with a
+ * placeholder token before the call; the mapping stays local, is never sent to the LLM provider,
+ * and is mapped back onto the answer afterwards. Same four categories as the Collector (email/
+ * phone/IBAN/card), detected via regex only - no NER, so names/addresses aren't caught. IBAN/
+ * phone patterns are German-format on purpose (this demo's data is German-market).
  */
 final class PiiTokenizer {
 
     private static final Pattern EMAIL = Pattern.compile("[\\w._%+-]+@[\\w.-]+\\.[A-Za-z]{2,}");
-    // Whitespace allowed BEFORE each digit (covers "DE89 3704 0044 0532 0130 00"), deliberately
-    // NOT after: an optional "\s?" as the last element before the word boundary would wrongly
-    // consume a real space AFTER the IBAN, because \b is still satisfied right after a consumed
-    // space (space = non-word, next char is usually a word char) - the match would then wrongly
-    // include a trailing space. With \s? before each digit, the match always ends on a digit.
+    // \s? BEFORE each digit, not after - covers space-separated IBANs ("DE89 3704...") while
+    // still always ending the match on a digit, so a trailing space is never swallowed.
     private static final Pattern IBAN = Pattern.compile("\\bDE\\d{2}(?:\\s?\\d){18}\\b");
     private static final Pattern CARD = Pattern.compile("\\b\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}[\\s-]?\\d{4}\\b");
     private static final Pattern PHONE = Pattern.compile("\\b(?:\\+49|0049|0)[\\s/-]?\\d[\\d\\s/-]{6,14}\\d\\b");
 
-    // Order matters here, it's not arbitrary: IBAN and CARD are long, unbroken digit sequences
-    // that the PHONE pattern (variable length, starts with "0"/"+49") could otherwise wrongly
-    // grab as a phone number. By replacing IBAN/CARD with tokens first, PHONE never sees those
-    // spots in the raw text anymore. EMAIL goes first because "@..." doesn't collide with any of
-    // the other three patterns.
+    // Order matters: IBAN/CARD (long digit runs) must be tokenized before PHONE, or PHONE could
+    // grab them as a phone number. EMAIL is independent of the other three.
     private static final List<CategoryPattern> CATEGORIES = List.of(
             new CategoryPattern("EMAIL", EMAIL),
             new CategoryPattern("IBAN", IBAN),

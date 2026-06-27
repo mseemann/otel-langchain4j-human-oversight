@@ -30,43 +30,18 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * Three-way router instead of an agentic loop.
+ * Three-way router instead of an agentic loop: the model's only decision is WHICH of three
+ * fixed-template routes applies - the customer's note is classification input only, never
+ * carried into, translated, or paraphrased in the answer. Enforced via
+ * toolChoice(ToolChoice.REQUIRED): a free-text response isn't a possible return type for this
+ * call, not just a prompt instruction. A successful manipulation of the routing decision still
+ * has a bounded, safe worst case in every branch (route 1: template facts only, route 2: human
+ * sign-off required, route 3: safe fallback) - see the README for the three routes in detail.
  *
- * Earlier versions of this endpoint removed only the committed VALUE (a voucher amount) from
- * model output (see GoodwillGesturePolicy) - the rest of the customer answer was still free,
- * model-formulated text that could in principle contain any statement, limited only by an
- * Output Guard's finite deny list. This router generalizes that principle: not just the amount,
- * but the ENTIRE text delivered to the customer never originates as model free text. The model
- * gets exactly ONE decision: which of three cases applies - the customer's note itself is NEVER
- * carried into the final answer, translated, or paraphrased; it's only used as classification
- * input.
- *
- * route_status_inquiry: nothing unusual - a plain status lookup.
- * propose_goodwill_gesture: the customer plausibly has a claim to some form of goodwill -
- *   reuses propose_goodwill_gesture unchanged (see GoodwillGesturePolicy).
- * escalate_to_support: everything else, including ambiguity - the safe catch-all, see
- *   ROUTER_SYSTEM_PROMPT for the priority rule.
- *
- * The three-way restriction isn't enforced by a prompt instruction alone, but additionally by
- * toolChoice(ToolChoice.REQUIRED) on the ChatRequest: Anthropic "tool_choice: any" - the model
- * MUST call one of the offered tools, a free-text response isn't even a possible response type
- * for this call. That alone is already a binary, code-verifiable fact about the Anthropic API,
- * not an interpretation of model text.
- *
- * Note: an earlier draft of this also tried to disable parallel tool use via
- * AnthropicChatRequestParameters.disableParallelToolUse(true) to prevent the model from choosing
- * multiple routes at once. That class doesn't exist in the deployed langchain4j-anthropic version
- * (1.16.2) - verified via javadoc.io. The replacement: explicitly checking toolCalls.size() != 1
- * below and treating both 0 and >1 tool calls as routingFailed.
- *
- * Important nuance: the CHOICE of route is still influenced by ROUTER_SYSTEM_PROMPT - a
- * sufficiently creative customerNote could in theory trigger the wrong route. The decisive
- * difference is: the OUTPUT for every one of the three possible routes is a fixed, safe Java
- * template. A successful manipulation of the routing decision has a bounded, safe worst case in
- * every branch: route 1 only delivers facts from a template, route 2 still needs a human sign-off
- * before any value moves, route 3 is the safest fallback there is. See
- * COMPENSATION_SIGNAL_KEYWORDS below for an independent backstop against a misclassification
- * towards route 1.
+ * Note: AnthropicChatRequestParameters.disableParallelToolUse(true), tried in an earlier draft to
+ * stop the model picking multiple routes at once, doesn't exist in langchain4j-anthropic 1.16.2
+ * (verified via javadoc.io). toolCalls.size() != 1 below covers the same case instead (0 or >1
+ * calls treated as routingFailed).
  */
 @RestController
 @RequestMapping("/lc4j")
@@ -74,10 +49,9 @@ public class LangChain4jController {
 
     private static final Logger log = LoggerFactory.getLogger(LangChain4jController.class);
 
-    // Package-private rather than private (here, on COMPENSATION_SIGNAL_KEYWORDS, containsAny(),
-    // and the three handle* methods below): lets a test class reach the deterministic building
-    // blocks directly without needing a real Anthropic call - only orderStatus() itself (the only
-    // part with a real chatModel.chat() call) isn't unit-testable this way.
+    // Package-private (here, on COMPENSATION_SIGNAL_KEYWORDS, containsAny(), and the three
+    // handle* methods below) so tests reach these deterministic building blocks directly,
+    // without a real Anthropic call - only orderStatus() itself needs one.
     static final String ROUTE_STATUS_INQUIRY = "route_status_inquiry";
     static final String ROUTE_GOODWILL_GESTURE = "propose_goodwill_gesture";
     static final String ROUTE_ESCALATE_SUPPORT = "escalate_to_support";
@@ -86,27 +60,18 @@ public class LangChain4jController {
             "Your request has been forwarded to our support team. A staff member will get back " +
             "to you shortly.";
 
-    // Misrouting backstop: independent of the model's own decision. Checks the raw customerNote
-    // for terms that typically indicate a compensation/complaint case - if these terms are
-    // present but the model still chose ROUTE_STATUS_INQUIRY, that's a second signal,
-    // independent of the model, that the routing decision might be wrong (see possibleMisroute
-    // in orderStatus()). Deliberately the same substring-list architecture as elsewhere in this
-    // codebase, but here not used to score model free text (there is none in this architecture
-    // anymore) - instead as a second, independent check AGAINST the model's decision. Same
-    // trade-off as elsewhere: false positives are possible (e.g. "I'm unhappy, but only because
-    // I'm impatient" also lands in the review queue), but a missed real compensation case (a
-    // false negative) is the more expensive problem.
+    // Misrouting backstop, independent of the model: flags ROUTE_STATUS_INQUIRY if the raw
+    // customerNote still contains compensation/complaint terms (see possibleMisroute in
+    // orderStatus()). Same trade-off as elsewhere - a missed real case is costlier than a false
+    // alarm.
     static final List<String> COMPENSATION_SIGNAL_KEYWORDS = List.of(
             "refund", "reimbursement", "compensation", "damages",
             "voucher", "discount", "money back", "broken", "damaged", "defective",
             "complaint", "dissatisfied", "disappointed", "not acceptable");
 
-    // Router system prompt. Unlike a plain answering prompt, the model's job here is
-    // exclusively classification, never text production - accordingly there's no section
-    // forbidding the model from promising anything: there simply is no tool that promises
-    // anything, and free text isn't reachable as a response type at all because of
-    // toolChoice=REQUIRED. The input-hardening passage about customerNote remains relevant and
-    // is kept.
+    // The model's job here is classification only, never text production - no need to forbid
+    // promises, since no tool promises anything and free text isn't reachable at all
+    // (toolChoice=REQUIRED). The customerNote input-hardening passage below still applies.
     private static final String ROUTER_SYSTEM_PROMPT = """
             You are a classifier for customer-service shipping-status requests. You don't
             answer anything yourself and never write an answer text - your only job is to call
@@ -139,8 +104,8 @@ public class LangChain4jController {
 
     private final AnthropicChatModel chatModel;
     private final Tracer tracer;
-    // Deliberately not injected as a Spring bean: no ObjectMapper bean is available in this
-    // context - a local instance is enough for plain argument parsing.
+    // Local instance, not a Spring bean - no ObjectMapper bean is available here, and this is
+    // plain argument parsing.
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public LangChain4jController(AnthropicChatModel chatModel, OpenTelemetry openTelemetry) {
@@ -148,16 +113,9 @@ public class LangChain4jController {
         this.tracer = openTelemetry.getTracer("otel-langchain4j-demo");
     }
 
-    // Lektion 3.3 carryover - flagForReview/userComment: the end user can flag their own request
-    // as "please take a look", independent of the automatic signals in
-    // tagHumanOversightSignals().
-    //
-    // IMPORTANT: for the deterministic paths, orderNumber always comes from this request
-    // parameter already received by the server, NEVER from a tool argument of the router -
-    // statusInquiryTool therefore doesn't take an order_number parameter at all, and in the
-    // goodwill path a diverging tool argument is ignored too (see handleGoodwillGesture). Only
-    // the CHOICE of route (which tool name) is ever taken from the model, never a value from
-    // tool arguments.
+    // flagForReview/userComment: end-user self-flag, independent of the automatic signals in
+    // tagHumanOversightSignals(). orderNumber always comes from this request parameter, never
+    // from a router tool argument - only the CHOSEN route is ever taken from the model.
     @GetMapping("/order-status")
     public String orderStatus(
             @RequestParam(defaultValue = "ORD-4711") String orderNumber,
@@ -261,12 +219,9 @@ public class LangChain4jController {
         return deliveredAnswer;
     }
 
-    // Route 1: deterministic status lookup, no second model call. The order number deliberately
-    // comes from the typed orderNumber parameter (request level), NOT from the router's tool
-    // arguments - statusInquiryTool therefore takes no parameters at all. Even if the model
-    // wanted to "invent" some value, there's no argument for it to write one into.
-    // OrderStatusLookup.lookup() is a pure, directly callable Java function - no second
-    // chatModel call needed to determine the (fixed demo) shipping data anyway.
+    // Route 1: deterministic, no second model call. orderNumber comes from the request
+    // parameter, not a tool argument - statusInquiryTool takes none, so there's no argument for
+    // the model to invent a value into.
     String handleStatusInquiry(String orderNumber, ToolExecutionRequest toolCall) {
         OrderStatusLookup.Result lookup = OrderStatusLookup.lookup(orderNumber);
 
@@ -293,10 +248,8 @@ public class LangChain4jController {
         }
     }
 
-    // Route 2: GoodwillGesturePolicy.evaluate() unchanged (see GoodwillGesturePolicy). The
-    // model's reason argument lands only in the span (audit trail for the human reviewer), never
-    // in the customer answer - otherwise injected text could still reach the customer via the
-    // "reason" detour.
+    // Route 2: GoodwillGesturePolicy.evaluate() unchanged. The model's reason argument lands
+    // only in the span (audit trail), never in the customer answer.
     String handleGoodwillGesture(String orderNumber, ToolExecutionRequest toolCall) {
         Map<String, String> args = parseArguments(toolCall);
         String modelOrderNumber = args.get("order_number");
@@ -339,8 +292,7 @@ public class LangChain4jController {
         }
     }
 
-    // Route 3: safe catch-all. reason lands only in the span, never in the customer answer
-    // (same reasoning as route 2).
+    // Route 3: safe catch-all, same reasoning as route 2 - reason lands only in the span.
     String handleEscalateToSupport(String orderNumber, ToolExecutionRequest toolCall) {
         Map<String, String> args = parseArguments(toolCall);
         String reason = args.getOrDefault("reason", "");
@@ -363,18 +315,10 @@ public class LangChain4jController {
         }
     }
 
-    // Human Oversight (Art. 14): radically simplified compared to an earlier seven-signal
-    // version. Most of the old signals are now STRUCTURALLY moot, not just unnecessary - they no
-    // longer have an equivalent in this architecture:
-    //
-    // - tool_sequence_anomaly/tool_sequence_actual: GONE. There's no longer a tool SEQUENCE that
-    //   could deviate from a canonical order - the router makes EXACTLY ONE decision per
-    //   request, no more multi-step agentic loop.
-    // - uncertainty_detected/status_keyword_missing: GONE. Both analyzed LLM free text - there
-    //   is none left in the customer answer (routes 1/2/3 are all fixed Java templates).
-    // - fallback_triggered/MAX_TOOL_STEPS: GONE. There's no more loop that could exhaust a step
-    //   budget. Superseded by routing_failed, which covers a categorically different, much rarer
-    //   case (an API/transport error, not "the model didn't decide").
+    // Human Oversight (Art. 14): radically simplified vs. an earlier seven-signal version - most
+    // old signals are now structurally moot (no tool sequence, no free text to analyze). See the
+    // article for the full before/after; routing_failed covers a categorically rarer case (an
+    // API/transport error, not a missing model decision).
     private void tagHumanOversightSignals(
             String route,
             OutputGuard.Result outputGuardResult,
@@ -398,8 +342,7 @@ public class LangChain4jController {
         span.setAttribute(AttributeKey.longKey("pii_guard.tokens_substituted"), piiTokensSubstituted);
 
         // Every route except the plain status lookup always needs review - route 2 awaits a
-        // human sign-off on a concrete proposal by design, route 3 is a catch-all that by
-        // definition wasn't confidently resolved by the router.
+        // human sign-off by design, route 3 wasn't confidently resolved by the router.
         boolean routeAlwaysNeedsReview = !ROUTE_STATUS_INQUIRY.equals(route);
         boolean needsReview = routeAlwaysNeedsReview || possibleMisroute || routingFailed
                 || outputGuardResult.blocked() || userFlagged;
@@ -414,9 +357,8 @@ public class LangChain4jController {
         }
     }
 
-    // Lowercases with Locale.ROOT rather than a language-specific locale: the keyword list and
-    // input text are plain English ASCII here, so a language-specific locale has no special
-    // relevance (unlike e.g. Turkish dotless-i edge cases, this comparison is locale-agnostic).
+    // Locale.ROOT, not a language-specific locale - keyword list and input are plain ASCII
+    // English, so locale quirks (e.g. Turkish dotless-i) don't apply here.
     static boolean containsAny(String text, List<String> needles) {
         String lower = (text == null ? "" : text).toLowerCase(Locale.ROOT);
         return needles.stream().anyMatch(lower::contains);
